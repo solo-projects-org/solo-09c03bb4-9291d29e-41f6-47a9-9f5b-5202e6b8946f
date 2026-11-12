@@ -3,12 +3,13 @@
 
 const state = {
   fileName: "",
-  tables: [],
+  tables: [],          // 当前公告解析出的全部表格
   tableIndex: 0,
-  mapping: { road: 1, direction: 2, start: 3, end: 4 },
+  // 每张表一份草稿：{ mapping, rows, origins }。
+  // rows 固定覆盖该表全部网格行（含表头行），改选列、切换表头开关、
+  // 切换表格都不丢改动；只有重新载入公告（上传 / 载入样例）才整体清空。
+  tableStates: {},
   skipHeader: true,
-  rows: [],          // 每行: { road, direction, start: TimeField, end: TimeField }
-  origins: { start: {}, end: {} }, // field -> originId -> { text, rowIndexes: number[] }
 };
 
 const FIELD_LABELS = { road: "路段", direction: "方向", start: "开始", end: "结束" };
@@ -61,9 +62,105 @@ function parseDateTime(text) {
   return null;
 }
 
+/* ---------- 每表草稿 ---------- */
+
+function currentTable() {
+  return state.tables[state.tableIndex];
+}
+
+function getDraft(index) {
+  if (!state.tableStates[index]) {
+    state.tableStates[index] = createDraft(state.tables[index]);
+  }
+  return state.tableStates[index];
+}
+
+function currentDraft() {
+  return getDraft(state.tableIndex);
+}
+
+function createDraft(table) {
+  const draft = {
+    mapping: autoDetectMapping(table),
+    rows: [],
+    origins: { start: {}, end: {} },
+  };
+  table.rows.forEach((gridRow, r) => {
+    const row = {
+      gridRow: r,
+      road: gridRow[draft.mapping.road]?.text || "",
+      direction: gridRow[draft.mapping.direction]?.text || "",
+      start: null,
+      end: null,
+    };
+    draft.rows.push(row);
+    row.start = makeTimeField(gridRow[draft.mapping.start], "start", r, draft);
+    row.end = makeTimeField(gridRow[draft.mapping.end], "end", r, draft);
+  });
+  return draft;
+}
+
+function autoDetectMapping(table) {
+  const headerCells = table.rows[0] || [];
+  const mapping = {};
+  for (const [key, words] of Object.entries(HEADER_KEYWORDS)) {
+    let found = -1;
+    headerCells.forEach((cell, c) => {
+      if (found === -1 && words.some((w) => cell.text.includes(w))) found = c;
+    });
+    mapping[key] = found !== -1 ? found
+      : Math.min(key === "road" ? 1 : key === "direction" ? 2 : key === "start" ? 3 : 4,
+                 table.colCount - 1);
+  }
+  return mapping;
+}
+
+function makeTimeField(cell, field, rowIndex, draft) {
+  const id = cell.id;
+  if (!draft.origins[field][id]) {
+    draft.origins[field][id] = { text: cell.text, rowIndexes: [] };
+  }
+  draft.origins[field][id].rowIndexes.push(rowIndex);
+  return { originId: id, override: null };
+}
+
+/* 改选列：仅换了来源的字段取新列原值，其余字段的改动（共用时间、单行覆盖）保留。 */
+function remapField(key, newCol) {
+  const draft = currentDraft();
+  const table = currentTable();
+  if (draft.mapping[key] === newCol) return;
+  draft.mapping[key] = newCol;
+
+  if (key === "road" || key === "direction") {
+    for (const row of draft.rows) {
+      row[key] = table.rows[row.gridRow][newCol]?.text || "";
+    }
+    return;
+  }
+  draft.origins[key] = {};
+  draft.rows.forEach((row, i) => {
+    row[key] = makeTimeField(table.rows[row.gridRow][newCol], key, i, draft);
+  });
+}
+
+/* 当前表参与采录（未被表头开关跳过）的草稿行下标 */
+function visibleRowIndexes() {
+  const draft = currentDraft();
+  const table = currentTable();
+  const { road, direction, start, end } = draft.mapping;
+  const indexes = [];
+  draft.rows.forEach((row, i) => {
+    const gridRow = table.rows[row.gridRow];
+    const isHeader = [road, direction, start, end].every((c) => gridRow[c]?.isHeader);
+    if (state.skipHeader && isHeader) return;
+    indexes.push(i);
+  });
+  return indexes;
+}
+
 function effectiveValue(row, field) {
   const f = row[field];
-  return f.override !== null ? f.override : state.origins[field][f.originId].text;
+  return f.override !== null ? f.override : currentDraft().origins[field][f.originId].text;
 }
 
 /* ---------- 数据载入 ---------- */
@@ -73,18 +170,19 @@ async function loadFromUrl(url) {
   const resp = await fetch(url);
   const data = await resp.json();
   if (!resp.ok) throw new Error(data.error || "载入失败");
+  applyLoadedNotice(data);
+}
+
+function applyLoadedNotice(data) {
   state.fileName = data.fileName;
   state.tables = data.tables;
   state.tableIndex = 0;
+  state.tableStates = {};   // 重新载入公告：不沿用旧稿
   $("#source-name").textContent = `已载入：${data.fileName}（${data.tables.length} 张表）`;
   $("#mapping-card").hidden = false;
   $("#editor-card").hidden = false;
   initTableSelect();
   selectTable(0);
-}
-
-function currentTable() {
-  return state.tables[state.tableIndex];
 }
 
 function initTableSelect() {
@@ -107,27 +205,32 @@ function selectTable(index) {
     }).join("");
   }
 
-  // 自动识别列
-  for (const [key, words] of Object.entries(HEADER_KEYWORDS)) {
-    let found = -1;
-    headerCells.forEach((cell, c) => {
-      if (found === -1 && words.some((w) => cell.text.includes(w))) found = c;
-    });
-    state.mapping[key] = found !== -1 ? found
-      : Math.min(key === "road" ? 1 : key === "direction" ? 2 : key === "start" ? 3 : 4,
-                 table.colCount - 1);
-    $(`#map-${key}`).value = state.mapping[key];
+  // 恢复该表草稿的列映射（首次进入时为自动识别结果）
+  const draft = getDraft(index);
+  for (const key of ["road", "direction", "start", "end"]) {
+    $(`#map-${key}`).value = draft.mapping[key];
   }
 
+  updateMappingWarning();
   renderPreview();
-  buildEditor();
+  renderEditor();
+}
+
+function updateMappingWarning() {
+  const mapping = currentDraft().mapping;
+  const dup = new Set(Object.values(mapping)
+    .filter((c, _, arr) => arr.indexOf(c) !== arr.lastIndexOf(c)));
+  $("#source-error").hidden = dup.size === 0;
+  if (dup.size) {
+    $("#source-error").textContent = "提示：路段/方向/开始/结束存在重复选择的列，请确认列映射是否正确。";
+  }
 }
 
 /* ---------- 原表预览 ---------- */
 
 function renderPreview() {
   const table = currentTable();
-  const mappedCols = new Set(Object.values(state.mapping));
+  const mappedCols = new Set(Object.values(currentDraft().mapping));
   const html = ["<thead></thead><tbody>"];
   table.rows.forEach((row) => {
     html.push("<tr>");
@@ -145,74 +248,33 @@ function renderPreview() {
   $("#preview-table").innerHTML = html.join("");
 }
 
-/* ---------- 采录模型 ---------- */
-
-function buildEditor() {
-  const table = currentTable();
-  const { road, direction, start, end } = state.mapping;
-  state.rows = [];
-  state.origins = { start: {}, end: {} };
-
-  const dup = new Set(Object.values(state.mapping)
-    .filter((c, _, arr) => arr.indexOf(c) !== arr.lastIndexOf(c)));
-  $("#source-error").hidden = dup.size === 0;
-  if (dup.size) {
-    $("#source-error").textContent = "提示：路段/方向/开始/结束存在重复选择的列，请确认列映射是否正确。";
-  }
-
-  table.rows.forEach((gridRow, r) => {
-    const roadCell = gridRow[road];
-    const dirCell = gridRow[direction];
-    const startCell = gridRow[start];
-    const endCell = gridRow[end];
-
-    if (state.skipHeader && [roadCell, dirCell, startCell, endCell].every((c) => c?.isHeader)) {
-      return;
-    }
-
-    const row = {
-      road: roadCell?.text || "",
-      direction: dirCell?.text || "",
-      start: makeTimeField(startCell, "start", r),
-      end: makeTimeField(endCell, "end", r),
-    };
-    state.rows.push(row);
-  });
-
-  renderEditor();
-}
-
-function makeTimeField(cell, field, _gridRow) {
-  const id = cell.id;
-  if (!state.origins[field][id]) {
-    state.origins[field][id] = { text: cell.text, rowIndexes: [] };
-  }
-  state.origins[field][id].rowIndexes.push(state.rows.length);
-  return { originId: id, override: null };
-}
-
 /* ---------- 编辑区渲染 ---------- */
 
 function renderEditor(focus) {
+  const draft = currentDraft();
+  const visible = visibleRowIndexes();
+  const visibleSet = new Set(visible);
+
   const head = `
     <thead><tr>
       <th style="width:46px">#</th><th>路段</th><th>方向</th>
       <th>开始时间（含日期与时分）</th><th>结束时间（含日期与时分）</th>
     </tr></thead>`;
 
-  const body = state.rows.map((row, i) => {
+  const body = visible.map((rowIndex, displayNum) => {
+    const row = draft.rows[rowIndex];
     const startErr = fieldError(row, "start");
     const endErr = fieldError(row, "end");
     const orderErr = orderError(row);
     const rowClass = startErr || endErr || orderErr ? ' class="row-error"' : "";
     return `<tr${rowClass}>
-      <td>${i + 1}</td>
-      <td><input class="road-input" data-field="road" data-row="${i}"
+      <td>${displayNum + 1}</td>
+      <td><input class="road-input" data-field="road" data-row="${rowIndex}"
                  value="${escapeHtml(row.road)}" placeholder="路段"></td>
-      <td><input class="dir-input" data-field="direction" data-row="${i}"
+      <td><input class="dir-input" data-field="direction" data-row="${rowIndex}"
                  value="${escapeHtml(row.direction)}" placeholder="方向"></td>
-      <td>${timeCellHtml(row, i, "start", startErr)}</td>
-      <td>${timeCellHtml(row, i, "end", endErr || orderErr)}</td>
+      <td>${timeCellHtml(row, rowIndex, "start", startErr, visibleSet)}</td>
+      <td>${timeCellHtml(row, rowIndex, "end", endErr || orderErr, visibleSet)}</td>
     </tr>`;
   }).join("");
 
@@ -229,9 +291,10 @@ function renderEditor(focus) {
   }
 }
 
-function timeCellHtml(row, rowIndex, field, errorMsg) {
+function timeCellHtml(row, rowIndex, field, errorMsg, visibleSet) {
+  const draft = currentDraft();
   const f = row[field];
-  const origin = state.origins[field][f.originId];
+  const origin = draft.origins[field][f.originId];
   const isOverride = f.override !== null;
   const value = isOverride ? f.override : origin.text;
   const cls = ["time-input", isOverride ? "override" : "origin",
@@ -241,11 +304,15 @@ function timeCellHtml(row, rowIndex, field, errorMsg) {
          data-row="${rowIndex}" data-timefield="${field}">撤销覆盖（取原格最新值）</button>`
     : `<button type="button" class="btn btn-mini" data-action="override"
          data-row="${rowIndex}" data-timefield="${field}">单独覆盖此行</button>`;
+  // 共用/受影响行数只统计当前参与采录（未跳过）的行
+  const sharedCount = origin.rowIndexes.filter((i) => visibleSet.has(i)).length;
+  const affectedCount = origin.rowIndexes.filter((i) =>
+    visibleSet.has(i) && draft.rows[i][field].override === null).length;
   const badge = isOverride ? ""
-    : `<span class="shared-badge">原格共用 ${origin.rowIndexes.length} 行</span>`;
+    : `<span class="shared-badge">原格共用 ${sharedCount} 行</span>`;
   const note = isOverride
     ? `<div class="origin-note">覆盖中；原格当前值：${escapeHtml(origin.text) || "（空）"}</div>`
-    : `<div class="origin-note">编辑此框将更新原格共用时间，仅作用于未覆盖的 ${origin.rowIndexes.length} 行</div>`;
+    : `<div class="origin-note">编辑此框将更新原格共用时间，仅作用于未覆盖的 ${affectedCount} 行</div>`;
   const errHtml = errorMsg ? `<div class="field-err">${escapeHtml(errorMsg)}</div>` : "";
 
   return `
@@ -268,26 +335,30 @@ function orderError(row) {
   return "";
 }
 
+/* 只校验当前表未跳过的行 */
 function collectErrors() {
-  return state.rows.map((row, i) => {
+  const draft = currentDraft();
+  return visibleRowIndexes().map((rowIndex, displayNum) => {
+    const row = draft.rows[rowIndex];
     const messages = [fieldError(row, "start"), fieldError(row, "end"), orderError(row)]
       .filter(Boolean);
-    return { row: i, messages };
+    return { row: displayNum, messages };
   }).filter((e) => e.messages.length);
 }
 
 function renderValidationSummary() {
   const errors = collectErrors();
+  const total = visibleRowIndexes().length;
   const list = $("#error-list");
   if (errors.length) {
     $("#validate-status").textContent =
-      `共 ${state.rows.length} 行，其中 ${errors.length} 行存在错误，导出已被阻止。`;
+      `共 ${total} 行，其中 ${errors.length} 行存在错误，导出已被阻止。`;
     $("#validate-status").className = "error-text";
     list.hidden = false;
     list.innerHTML = errors.map((e) =>
       `<li>第 ${e.row + 1} 行：${e.messages.map(escapeHtml).join("；")}</li>`).join("");
   } else {
-    $("#validate-status").textContent = `共 ${state.rows.length} 行，全部校验通过，可以导出。`;
+    $("#validate-status").textContent = `共 ${total} 行，全部校验通过，可以导出。`;
     $("#validate-status").className = "muted";
     list.hidden = true;
     list.innerHTML = "";
@@ -299,16 +370,17 @@ function renderValidationSummary() {
 $("#editor-table").addEventListener("input", (ev) => {
   const target = ev.target;
   const rowIndex = Number(target.dataset.row);
-  if (!Number.isInteger(rowIndex) || !state.rows[rowIndex]) return;
+  const draft = currentDraft();
+  if (!Number.isInteger(rowIndex) || !draft.rows[rowIndex]) return;
 
   if (target.dataset.field === "road" || target.dataset.field === "direction") {
-    state.rows[rowIndex][target.dataset.field] = target.value;
+    draft.rows[rowIndex][target.dataset.field] = target.value;
     return;
   }
 
   const field = target.dataset.timefield;
   if (field !== "start" && field !== "end") return;
-  const row = state.rows[rowIndex];
+  const row = draft.rows[rowIndex];
 
   if (row[field].override !== null) {
     // 单行覆盖：只改本行
@@ -320,7 +392,7 @@ $("#editor-table").addEventListener("input", (ev) => {
       !!(fieldError(row, "start") || fieldError(row, "end") || orderError(row)));
   } else {
     // 原格共用时间：更新原格，仅影响未覆盖的共用行
-    state.origins[field][row[field].originId].text = target.value;
+    draft.origins[field][row[field].originId].text = target.value;
     renderEditor({ row: rowIndex, field });
   }
 });
@@ -330,7 +402,8 @@ $("#editor-table").addEventListener("click", (ev) => {
   if (!btn) return;
   const rowIndex = Number(btn.dataset.row);
   const field = btn.dataset.timefield;
-  const row = state.rows[rowIndex];
+  const row = currentDraft().rows[rowIndex];
+  if (!row || (field !== "start" && field !== "end")) return;
 
   if (btn.dataset.action === "override") {
     row[field].override = effectiveValue(row, field);
@@ -342,20 +415,24 @@ $("#editor-table").addEventListener("click", (ev) => {
   }
 });
 
-/* ---------- 导出 ---------- */
+/* ---------- 导出（只导出当前表未跳过的行） ---------- */
 
 $("#export-btn").addEventListener("click", async () => {
   if (collectErrors().length) {
     renderValidationSummary();
     return;
   }
+  const draft = currentDraft();
   const payload = {
-    rows: state.rows.map((row) => ({
-      road: row.road,
-      direction: row.direction,
-      start: effectiveValue(row, "start"),
-      end: effectiveValue(row, "end"),
-    })),
+    rows: visibleRowIndexes().map((rowIndex) => {
+      const row = draft.rows[rowIndex];
+      return {
+        road: row.road,
+        direction: row.direction,
+        start: effectiveValue(row, "start"),
+        end: effectiveValue(row, "end"),
+      };
+    }),
   };
 
   const resp = await fetch("/api/export", {
@@ -399,15 +476,7 @@ $("#file-input").addEventListener("change", async (ev) => {
     const resp = await fetch("/api/upload", { method: "POST", body: form });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || "上传失败");
-    state.fileName = data.fileName;
-    state.tables = data.tables;
-    state.tableIndex = 0;
-    $("#source-error").hidden = true;
-    $("#source-name").textContent = `已载入：${data.fileName}（${data.tables.length} 张表）`;
-    $("#mapping-card").hidden = false;
-    $("#editor-card").hidden = false;
-    initTableSelect();
-    selectTable(0);
+    applyLoadedNotice(data);
   } catch (err) {
     $("#source-error").textContent = err.message;
     $("#source-error").hidden = false;
@@ -427,13 +496,15 @@ $("#table-select").addEventListener("change", (ev) => selectTable(Number(ev.targ
 
 for (const key of ["road", "direction", "start", "end"]) {
   $(`#map-${key}`).addEventListener("change", (ev) => {
-    state.mapping[key] = Number(ev.target.value);
+    remapField(key, Number(ev.target.value));
+    updateMappingWarning();
     renderPreview();
-    buildEditor();
+    renderEditor();
   });
 }
 
 $("#skip-header").addEventListener("change", (ev) => {
+  // 表头开关只决定哪些行参与采录；草稿保留全部行的改动
   state.skipHeader = ev.target.checked;
-  buildEditor();
+  renderEditor();
 });
